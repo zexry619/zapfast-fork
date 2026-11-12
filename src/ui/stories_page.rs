@@ -371,11 +371,12 @@ fn contact_status_row(
         let title_pos = pos2(text_left, rect.center().y - 10.0);
         let sub_pos = pos2(text_left, rect.center().y + 8.0);
 
+        let display_name = app.person_name(&contact.sender, Some(&contact.sender_name));
         theme::paint_text(
             ui,
             title_pos,
             Align2::LEFT_CENTER,
-            &contact.sender_name,
+            &display_name,
             theme::semibold(14.0),
             palette.text,
         );

@@ -3147,7 +3147,7 @@ impl App {
             || crate::model::phone_of(me).is_some_and(|phone| phone.contains(needle))
     }
 
-    fn person_name(&self, id: &str, hint: Option<&str>) -> String {
+    pub fn person_name(&self, id: &str, hint: Option<&str>) -> String {
         self.person_name_of(id, hint, None)
     }
 
@@ -7490,6 +7490,22 @@ impl App {
                     // starred messages as it replaces the chats.
                     self.show_starred = false;
                 }
+                if page == Page::Stories {
+                    self.show_starred = false;
+                    self.backend.send(Command::SubscribeStoriesPresence);
+                    for items in self.stories.stories_by_sender.values() {
+                        for item in items {
+                            if item.media_path.is_none() {
+                                if let Some(ref raw) = item.raw_message {
+                                    self.backend.send(Command::DownloadStoryMedia {
+                                        id: item.id.clone(),
+                                        raw_message: raw.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
                 // Typed passwords do not wait in a form nobody sees.
                 if page != Page::Settings && !self.app_lock.checking() {
                     self.app_lock.form = None;
@@ -10142,12 +10158,17 @@ impl App {
                 }
             }
             Action::OpenStoryViewer { sender, index } => {
+                self.video.stop();
+                self.video.set_expanded(true);
                 self.story_viewer = Some(crate::ui::stories::StoryViewerState::new(sender, index));
             }
             Action::CloseStoryViewer => {
+                self.video.stop();
+                self.video.set_expanded(false);
                 self.story_viewer = None;
             }
             Action::NextStory => {
+                self.video.stop();
                 if let Some(viewer) = self.story_viewer.clone() {
                     if let Some((next_sender, next_index)) =
                         self.stories.next_item(&viewer.sender, viewer.index)
@@ -10162,6 +10183,7 @@ impl App {
                 }
             }
             Action::PrevStory => {
+                self.video.stop();
                 if let Some(viewer) = self.story_viewer.clone() {
                     if let Some((prev_sender, prev_index)) =
                         self.stories.prev_item(&viewer.sender, viewer.index)
@@ -11020,7 +11042,11 @@ impl App {
     /// Shows the playing video's frames, stops it once its chat is left, and
     /// hands a video it cannot decode to the system player.
     fn tick_video(&mut self, ctx: &egui::Context) {
-        if self.video.message().is_some() && self.video_chat != self.open_chat {
+        if self.story_viewer.is_some() {
+            if let Some(msg) = self.video.message() {
+                self.video.saw(msg);
+            }
+        } else if self.video.message().is_some() && self.video_chat != self.open_chat {
             self.video.stop();
         }
         // The viewer shows the open chat's media, and leaves with it.
@@ -11036,13 +11062,23 @@ impl App {
         }
         // Larger frames while the viewer shows the clip, the bubble's size
         // otherwise. Only a clip on the viewer plays while it is open.
-        self.video.set_expanded(self.image_preview.is_some());
+        self.video.set_expanded(self.image_preview.is_some() || self.story_viewer.is_some());
         if let Some(crate::video::Notice::Unsupported(path)) = self.video.poll(ctx) {
-            self.toast(crate::i18n::gettext(
-                self.locale,
-                "This video opens in your system player",
-            ));
-            self.actions.push(Action::OpenFile(path));
+            if self.story_viewer.is_some() {
+                if let Some(msg) = self.video.message().map(str::to_owned) {
+                    self.video.mark_unsupported(&msg);
+                }
+                self.toast(crate::i18n::gettext(
+                    self.locale,
+                    "Format video status tidak didukung pemutar internal",
+                ));
+            } else {
+                self.toast(crate::i18n::gettext(
+                    self.locale,
+                    "This video opens in your system player",
+                ));
+                self.actions.push(Action::OpenFile(path));
+            }
         }
     }
 

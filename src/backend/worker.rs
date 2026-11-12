@@ -4103,16 +4103,7 @@ impl Worker {
                 };
                 self.remember_identity(pn, lid, name);
                 self.set_status(LinkStatus::Connected);
-                if let Some(client) = self.client.clone() {
-                    tokio::spawn(async move {
-                        let status_jid = Jid::status_broadcast();
-                        if let Err(e) = client.presence().subscribe(status_jid).await {
-                            log::warn!("failed to subscribe to status@broadcast presence: {e}");
-                        } else {
-                            log::info!("successfully subscribed to status@broadcast presence updates");
-                        }
-                    });
-                }
+                self.subscribe_stories_presence();
                 self.fetch_blocklist();
                 self.retry_message_removals();
                 // A new connection may reach a phone that was away before.
@@ -5125,6 +5116,46 @@ impl Worker {
         self.emit(Event::StoryRevoked(id));
     }
 
+    fn subscribe_stories_presence(&self) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let mut recipient_set = std::collections::HashSet::new();
+        if let Ok(contacts) = self.archive.contacts() {
+            for c in contacts {
+                if let Ok(jid) = c.id.parse::<Jid>() {
+                    if (jid.is_pn() || jid.is_lid()) && !self.is_me(&c.id) {
+                        recipient_set.insert(jid);
+                    }
+                }
+            }
+        }
+        if let Ok(chats) = self.archive.chats() {
+            for c in chats {
+                if c.kind == ChatKind::Direct {
+                    if let Ok(jid) = c.id.parse::<Jid>() {
+                        if (jid.is_pn() || jid.is_lid()) && !self.is_me(&c.id) {
+                            recipient_set.insert(jid);
+                        }
+                    }
+                }
+            }
+        }
+        tokio::spawn(async move {
+            let status_jid = Jid::status_broadcast();
+            if let Err(e) = client.presence().subscribe(status_jid).await {
+                log::warn!("failed to subscribe to status@broadcast presence: {e}");
+            } else {
+                log::info!("successfully subscribed to status@broadcast presence updates");
+            }
+            let count = recipient_set.len();
+            for jid in recipient_set {
+                let _ = client.presence().subscribe(jid).await;
+            }
+            log::info!("subscribed to presence for {count} stories contacts");
+        });
+    }
+
     /// Replies to a status / story, sending a regular message to the contact quoting the story.
     fn reply_story(
         &mut self,
@@ -5373,8 +5404,10 @@ impl Worker {
         let mut font = None;
         let mut media_type = None;
         let mut caption = None;
-        let mut thumbnail = None;
+        let mut thumbnail = message.thumbnail.clone();
         let mut media_path = None;
+        let mut downloadable: Option<Box<dyn Downloadable>> = None;
+        let mut file_ext = "";
 
         if let Ok(wa_msg) = wa::Message::decode_from_slice(&message.raw) {
             let base = wa_msg.get_base_message();
@@ -5395,12 +5428,16 @@ impl Worker {
                 if img.jpeg_thumbnail.as_ref().is_some_and(|b| !b.is_empty()) {
                     thumbnail = img.jpeg_thumbnail.clone();
                 }
+                downloadable = Some(Box::new(img.clone()));
+                file_ext = "jpg";
             } else if let Some(vid) = base.video_message.as_option() {
                 media_type = Some(crate::stories::StoryMediaType::Video);
                 caption = vid.caption.clone().filter(|s| !s.is_empty());
                 if vid.jpeg_thumbnail.as_ref().is_some_and(|b| !b.is_empty()) {
                     thumbnail = vid.jpeg_thumbnail.clone();
                 }
+                downloadable = Some(Box::new(vid.clone()));
+                file_ext = "mp4";
             }
         } else {
             match &message.content {
@@ -5418,11 +5455,39 @@ impl Worker {
         }
 
         let dir = self.download_dir("status@broadcast");
-        for ext in &["jpg", "mp4"] {
-            let story_file = dir.join(format!("story-{}.{}", message.id, ext));
+        if !file_ext.is_empty() {
+            let story_file = dir.join(format!("story-{}.{}", message.id, file_ext));
             if story_file.exists() {
                 media_path = Some(story_file.to_string_lossy().to_string());
-                break;
+            } else if let (Some(client), Some(dl)) = (self.client.clone(), downloadable) {
+                let events = self.events.clone();
+                let waker = self.waker.clone();
+                let story_id = message.id.clone();
+                let dest_path = story_file;
+                let dest_dir = dir.clone();
+                tokio::spawn(async move {
+                    let result = with_attachment_deadline(ATTACHMENT_TIMEOUT, async {
+                        download_attachment(&client, &*dl, &dest_dir, &dest_path, ATTACHMENT_DOWNLOAD_LIMIT).await
+                    })
+                    .await;
+                    match result {
+                        Ok(p) => {
+                            log::info!("Downloaded history story media for {}: {:?}", story_id, p);
+                            let _ = events.send(Event::StoryMediaDownloaded {
+                                id: story_id,
+                                path: p.to_string_lossy().to_string(),
+                            });
+                            waker.wake();
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "Failed to download history story media {}: {}",
+                                story_id,
+                                e
+                            );
+                        }
+                    }
+                });
             }
         }
 
@@ -7891,6 +7956,9 @@ impl Worker {
             }
             Command::RevokeStory(id) => {
                 self.revoke_story(id);
+            }
+            Command::SubscribeStoriesPresence => {
+                self.subscribe_stories_presence();
             }
             Command::FetchBlocklist => self.fetch_blocklist(),
             Command::SetBlocked { chat, blocked } => self.set_blocked(chat, blocked),

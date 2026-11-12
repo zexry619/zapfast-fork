@@ -177,6 +177,8 @@ pub enum Command {
     },
     /// Revokes an owned story/status by id.
     RevokeStory(String),
+    /// Subscribes to status@broadcast and all contacts' presence to receive status updates.
+    SubscribeStoriesPresence,
     FetchBlocklist,
     SetBlocked {
         chat: ChatId,
