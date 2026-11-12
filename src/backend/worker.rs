@@ -4103,6 +4103,16 @@ impl Worker {
                 };
                 self.remember_identity(pn, lid, name);
                 self.set_status(LinkStatus::Connected);
+                if let Some(client) = self.client.clone() {
+                    tokio::spawn(async move {
+                        let status_jid = Jid::status_broadcast();
+                        if let Err(e) = client.presence().subscribe(status_jid).await {
+                            log::warn!("failed to subscribe to status@broadcast presence: {e}");
+                        } else {
+                            log::info!("successfully subscribed to status@broadcast presence updates");
+                        }
+                    });
+                }
                 self.fetch_blocklist();
                 self.retry_message_removals();
                 // A new connection may reach a phone that was away before.
@@ -5075,9 +5085,371 @@ impl Worker {
                 .is_some_and(|chat| chat.can_mention_everyone())
     }
 
+    fn revoke_story(&mut self, id: String) {
+        if let Some(client) = self.client.clone() {
+            let mut recipient_set = std::collections::HashSet::new();
+            if let Ok(contacts) = self.archive.contacts() {
+                for c in contacts {
+                    if let Ok(jid) = c.id.parse::<Jid>() {
+                        if (jid.is_pn() || jid.is_lid()) && !self.is_me(&c.id) {
+                            recipient_set.insert(jid);
+                        }
+                    }
+                }
+            }
+            if let Ok(chats) = self.archive.chats() {
+                for c in chats {
+                    if c.kind == ChatKind::Direct {
+                        if let Ok(jid) = c.id.parse::<Jid>() {
+                            if (jid.is_pn() || jid.is_lid()) && !self.is_me(&c.id) {
+                                recipient_set.insert(jid);
+                            }
+                        }
+                    }
+                }
+            }
+            let recipients: Vec<Jid> = recipient_set.into_iter().collect();
+            let id_clone = id.clone();
+            tokio::spawn(async move {
+                if let Ok(msg_id) = whatsapp_rust::MessageId::new(&id_clone) {
+                    if let Err(e) = client
+                        .status()
+                        .revoke(msg_id, &recipients, Default::default())
+                        .await
+                    {
+                        log::warn!("Failed to revoke status on WhatsApp: {e:?}");
+                    }
+                }
+            });
+        }
+        self.emit(Event::StoryRevoked(id));
+    }
+
+    /// Replies to a status / story, sending a regular message to the contact quoting the story.
+    fn reply_story(
+        &mut self,
+        sender: String,
+        story_id: String,
+        text: String,
+        raw_message: Option<Vec<u8>>,
+    ) {
+        let (Some(client), Some(jid)) = (self.client.clone(), Self::jid_of(&sender)) else {
+            self.emit(Event::Error(
+                "Not connected to WhatsApp or invalid contact".to_owned(),
+            ));
+            return;
+        };
+
+        let original = raw_message
+            .as_deref()
+            .and_then(|raw| wa::Message::decode_from_slice(raw).ok())
+            .unwrap_or_default();
+
+        let sender_jid = Self::jid_of(&sender).unwrap_or_else(|| jid.clone());
+        let status_jid = Jid::status_broadcast();
+        let context = whatsapp_rust::wacore::proto_helpers::build_quote_context_with_info(
+            story_id.clone(),
+            &sender_jid,
+            &status_jid,
+            &jid,
+            &original,
+        );
+
+        let chat = sender.clone();
+        let mut message = outgoing_text(text.clone(), Some(context), &[]);
+        let expiration = self.apply_ephemeral(&chat, &mut message);
+        let id = client.generate_message_id();
+
+        // Extract a clean summary of the status being replied to
+        let base = original.get_base_message();
+        let summary = if let Some(ref ext) = base.extended_text_message.as_option() {
+            ext.text.as_deref().unwrap_or("Status").to_string()
+        } else if let Some(ref txt) = base.conversation.as_deref() {
+            txt.to_string()
+        } else if let Some(ref img) = base.image_message.as_option() {
+            img.caption
+                .clone()
+                .unwrap_or_else(|| "Status (Photo)".to_string())
+        } else if let Some(ref vid) = base.video_message.as_option() {
+            vid.caption
+                .clone()
+                .unwrap_or_else(|| "Status (Video)".to_string())
+        } else {
+            "Status".to_string()
+        };
+
+        let quoted = Quoted {
+            chat: None,
+            mentions: Vec::new(),
+            id: story_id,
+            sender_name: self
+                .archive
+                .contact(&sender)
+                .ok()
+                .flatten()
+                .and_then(|c| c.display_name().map(String::from))
+                .or_else(|| self.name_for(&sender)),
+            sender: sender.clone(),
+            summary,
+            labelled: None,
+        };
+
+        let id_str = id.to_string();
+        let row = Message {
+            id: id_str.clone(),
+            chat: chat.clone(),
+            sender: self.me(),
+            sender_name: None,
+            from_me: true,
+            timestamp: crate::util::now(),
+            content: Content::text(text),
+            status: Delivery::Pending,
+            delivered_at: None,
+            read_at: None,
+            quoted: Some(quoted),
+            reactions: Vec::new(),
+            history_order: None,
+            edited: false,
+            mentions: Vec::new(),
+            forwarded: false,
+            thumbnail: None,
+        };
+        self.store_message(row, Some(message.encode_to_vec()), None);
+        tokio::spawn(send_outgoing(
+            client,
+            self.commands.clone(),
+            chat,
+            jid,
+            id_str,
+            message,
+            expiration,
+            None,
+        ));
+    }
+
+    fn handle_status_broadcast(&mut self, message: &Arc<wa::Message>, info: &MessageInfo) {
+        let from_me = info.source.is_from_me;
+        let sender = if from_me {
+            self.me()
+        } else {
+            self.canonical(&info.source.sender)
+        };
+        let sender_name = if from_me {
+            Some("You".to_string())
+        } else {
+            self.archive
+                .contact(&sender)
+                .ok()
+                .flatten()
+                .and_then(|c| c.display_name().map(String::from))
+                .or_else(|| self.archive.chat(&sender).ok().flatten().map(|c| c.name))
+                .or_else(|| (!info.push_name.is_empty()).then(|| info.push_name.to_string()))
+        };
+
+        let timestamp = info.timestamp.timestamp().max(0) as u64;
+        let id = info.id.to_string();
+        let base = message.get_base_message();
+
+        let mut text = None;
+        let mut background_argb = None;
+        let mut font = None;
+        let mut media_type = None;
+        let mut caption = None;
+        let mut thumbnail = None;
+
+        let mut media_path = None;
+        let mut downloadable: Option<Box<dyn Downloadable>> = None;
+        let mut file_ext = "";
+
+        if let Some(ext) = base.extended_text_message.as_option() {
+            text = ext.text.clone();
+            background_argb = ext.background_argb;
+            font = ext.font.map(|f| f as u32);
+            if ext.jpeg_thumbnail.as_ref().is_some_and(|b| !b.is_empty()) {
+                thumbnail = ext.jpeg_thumbnail.clone();
+            }
+        } else if let Some(txt) = base.conversation.as_deref() {
+            text = Some(txt.to_string());
+        }
+
+        if let Some(img) = base.image_message.as_option() {
+            media_type = Some(crate::stories::StoryMediaType::Image);
+            caption = img.caption.clone().filter(|s| !s.is_empty());
+            if img.jpeg_thumbnail.as_ref().is_some_and(|b| !b.is_empty()) {
+                thumbnail = img.jpeg_thumbnail.clone();
+            }
+            downloadable = Some(Box::new(img.clone()));
+            file_ext = "jpg";
+        } else if let Some(vid) = base.video_message.as_option() {
+            media_type = Some(crate::stories::StoryMediaType::Video);
+            caption = vid.caption.clone().filter(|s| !s.is_empty());
+            if vid.jpeg_thumbnail.as_ref().is_some_and(|b| !b.is_empty()) {
+                thumbnail = vid.jpeg_thumbnail.clone();
+            }
+            downloadable = Some(Box::new(vid.clone()));
+            file_ext = "mp4";
+        }
+
+        let dir = self.download_dir("status@broadcast");
+        if !file_ext.is_empty() {
+            let story_file = dir.join(format!("story-{}.{}", id, file_ext));
+            if story_file.exists() {
+                media_path = Some(story_file.to_string_lossy().to_string());
+            } else if let (Some(client), Some(dl)) = (self.client.clone(), downloadable) {
+                let events = self.events.clone();
+                let waker = self.waker.clone();
+                let story_id = id.clone();
+                let dest_path = story_file;
+                let dest_dir = dir.clone();
+                tokio::spawn(async move {
+                    let result = with_attachment_deadline(ATTACHMENT_TIMEOUT, async {
+                        download_attachment(&client, &*dl, &dest_dir, &dest_path, ATTACHMENT_DOWNLOAD_LIMIT).await
+                    })
+                    .await;
+                    match result {
+                        Ok(p) => {
+                            log::info!("Downloaded story media for {}: {:?}", story_id, p);
+                            let _ = events.send(Event::StoryMediaDownloaded {
+                                id: story_id,
+                                path: p.to_string_lossy().to_string(),
+                            });
+                            waker.wake();
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to download story media {}: {}", story_id, e);
+                        }
+                    }
+                });
+            }
+        }
+
+        if text.is_some() || media_type.is_some() {
+            let story_item = crate::stories::StoryItem {
+                id,
+                sender: sender.clone(),
+                sender_name,
+                timestamp,
+                text,
+                background_argb,
+                font,
+                media_type,
+                caption,
+                thumbnail,
+                media_path,
+                raw_message: Some(message.encode_to_vec()),
+                viewed: from_me,
+            };
+            self.emit(Event::StoryReceived(Box::new(story_item)));
+        }
+    }
+
+    fn ingest_history_status(&mut self, message: &ParsedMessage, now_secs: u64) {
+        let timestamp = message.timestamp.max(0) as u64;
+        if now_secs.saturating_sub(timestamp) > 24 * 3600 {
+            return;
+        }
+        let from_me = message.from_me;
+        let sender = if from_me {
+            self.me()
+        } else if let Some(ref sender_str) = message.sender {
+            self.canonical_str(sender_str)
+        } else {
+            return;
+        };
+        let sender_name = if from_me {
+            Some("You".to_string())
+        } else {
+            self.archive
+                .contact(&sender)
+                .ok()
+                .flatten()
+                .and_then(|c| c.display_name().map(String::from))
+                .or_else(|| self.archive.chat(&sender).ok().flatten().map(|c| c.name))
+                .or_else(|| message.push_name.clone())
+        };
+
+        let mut text = None;
+        let mut background_argb = None;
+        let mut font = None;
+        let mut media_type = None;
+        let mut caption = None;
+        let mut thumbnail = None;
+        let mut media_path = None;
+
+        if let Ok(wa_msg) = wa::Message::decode_from_slice(&message.raw) {
+            let base = wa_msg.get_base_message();
+            if let Some(ext) = base.extended_text_message.as_option() {
+                text = ext.text.clone();
+                background_argb = ext.background_argb;
+                font = ext.font.map(|f| f as u32);
+                if ext.jpeg_thumbnail.as_ref().is_some_and(|b| !b.is_empty()) {
+                    thumbnail = ext.jpeg_thumbnail.clone();
+                }
+            } else if let Some(txt) = base.conversation.as_deref() {
+                text = Some(txt.to_string());
+            }
+
+            if let Some(img) = base.image_message.as_option() {
+                media_type = Some(crate::stories::StoryMediaType::Image);
+                caption = img.caption.clone().filter(|s| !s.is_empty());
+                if img.jpeg_thumbnail.as_ref().is_some_and(|b| !b.is_empty()) {
+                    thumbnail = img.jpeg_thumbnail.clone();
+                }
+            } else if let Some(vid) = base.video_message.as_option() {
+                media_type = Some(crate::stories::StoryMediaType::Video);
+                caption = vid.caption.clone().filter(|s| !s.is_empty());
+                if vid.jpeg_thumbnail.as_ref().is_some_and(|b| !b.is_empty()) {
+                    thumbnail = vid.jpeg_thumbnail.clone();
+                }
+            }
+        } else {
+            match &message.content {
+                Content::Text { text: t, .. } => text = Some(t.clone()),
+                Content::Image { caption: c, .. } => {
+                    media_type = Some(crate::stories::StoryMediaType::Image);
+                    caption = c.clone();
+                }
+                Content::Video { caption: c, .. } => {
+                    media_type = Some(crate::stories::StoryMediaType::Video);
+                    caption = c.clone();
+                }
+                _ => {}
+            }
+        }
+
+        let dir = self.download_dir("status@broadcast");
+        for ext in &["jpg", "mp4"] {
+            let story_file = dir.join(format!("story-{}.{}", message.id, ext));
+            if story_file.exists() {
+                media_path = Some(story_file.to_string_lossy().to_string());
+                break;
+            }
+        }
+
+        if text.is_some() || media_type.is_some() {
+            let story_item = crate::stories::StoryItem {
+                id: message.id.clone(),
+                sender,
+                sender_name,
+                timestamp,
+                text,
+                background_argb,
+                font,
+                media_type,
+                caption,
+                thumbnail,
+                media_path,
+                raw_message: Some(message.raw.clone()),
+                viewed: from_me,
+            };
+            self.emit(Event::StoryReceived(Box::new(story_item)));
+        }
+    }
+
     fn ingest(&mut self, message: &Arc<wa::Message>, info: &MessageInfo) {
         self.learn_source(&info.source);
         if info.source.chat.is_status_broadcast() {
+            self.handle_status_broadcast(message, info);
             return;
         }
         let Some(chat) = self.message_chat(info) else {
@@ -6291,6 +6663,16 @@ impl Worker {
         }
         for mut chat in parsed.chats {
             let id = self.canonical_str(&chat.id);
+            if id == "status@broadcast" || chat.id == "status@broadcast" {
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                for message in chat.messages {
+                    self.ingest_history_status(&message, now_secs);
+                }
+                continue;
+            }
             if id.ends_with("@broadcast") {
                 continue;
             }
@@ -7195,6 +7577,321 @@ impl Worker {
             return;
         }
         match command {
+            Command::PostTextStory {
+                text,
+                background_argb,
+                font,
+            } => {
+                let Some(client) = self.client.clone() else {
+                    self.emit(Event::StoryPosted(Err("Not connected to WhatsApp".into())));
+                    return;
+                };
+                let mut recipient_set = std::collections::HashSet::new();
+                if let Ok(contacts) = self.archive.contacts() {
+                    for c in contacts {
+                        if let Ok(jid) = c.id.parse::<Jid>() {
+                            if (jid.is_pn() || jid.is_lid()) && !self.is_me(&c.id) {
+                                recipient_set.insert(jid);
+                            }
+                        }
+                    }
+                }
+                if let Ok(chats) = self.archive.chats() {
+                    for c in chats {
+                        if c.kind == ChatKind::Direct {
+                            if let Ok(jid) = c.id.parse::<Jid>() {
+                                if (jid.is_pn() || jid.is_lid()) && !self.is_me(&c.id) {
+                                    recipient_set.insert(jid);
+                                }
+                            }
+                        }
+                    }
+                }
+                let recipients: Vec<Jid> = recipient_set.into_iter().collect();
+                if recipients.is_empty() {
+                    self.emit(Event::StoryPosted(Err(
+                        "No contacts found to share status with".into(),
+                    )));
+                    return;
+                }
+                let font_enum = match font {
+                    1 => wa::message::extended_text_message::FontType::SYSTEM_TEXT,
+                    2 => wa::message::extended_text_message::FontType::FB_SCRIPT,
+                    6 => wa::message::extended_text_message::FontType::SYSTEM_BOLD,
+                    7 => wa::message::extended_text_message::FontType::MORNINGBREEZE_REGULAR,
+                    8 => wa::message::extended_text_message::FontType::CALISTOGA_REGULAR,
+                    9 => wa::message::extended_text_message::FontType::EXO2_EXTRABOLD,
+                    10 => wa::message::extended_text_message::FontType::COURIERPRIME_BOLD,
+                    _ => wa::message::extended_text_message::FontType::SYSTEM,
+                };
+                let events = self.events.clone();
+                let waker = self.waker.clone();
+                tokio::spawn(async move {
+                    let result = client
+                        .status()
+                        .send_text(
+                            &text,
+                            background_argb,
+                            font_enum,
+                            &recipients,
+                            Default::default(),
+                        )
+                        .await;
+                    match result {
+                        Ok(_) => {
+                            let _ = events.send(Event::StoryPosted(Ok(())));
+                        }
+                        Err(e) => {
+                            let _ = events.send(Event::StoryPosted(Err(e.to_string())));
+                        }
+                    }
+                    waker.wake();
+                });
+            }
+            Command::PostImageStory { bytes, caption } => {
+                let Some(client) = self.client.clone() else {
+                    self.emit(Event::StoryPosted(Err("Not connected to WhatsApp".into())));
+                    return;
+                };
+                let mut recipient_set = std::collections::HashSet::new();
+                if let Ok(contacts) = self.archive.contacts() {
+                    for c in contacts {
+                        if let Ok(jid) = c.id.parse::<Jid>() {
+                            if (jid.is_pn() || jid.is_lid()) && !self.is_me(&c.id) {
+                                recipient_set.insert(jid);
+                            }
+                        }
+                    }
+                }
+                if let Ok(chats) = self.archive.chats() {
+                    for c in chats {
+                        if c.kind == ChatKind::Direct {
+                            if let Ok(jid) = c.id.parse::<Jid>() {
+                                if (jid.is_pn() || jid.is_lid()) && !self.is_me(&c.id) {
+                                    recipient_set.insert(jid);
+                                }
+                            }
+                        }
+                    }
+                }
+                let recipients: Vec<Jid> = recipient_set.into_iter().collect();
+                if recipients.is_empty() {
+                    self.emit(Event::StoryPosted(Err(
+                        "No contacts found to share status with".into(),
+                    )));
+                    return;
+                }
+                let events = self.events.clone();
+                let waker = self.waker.clone();
+                tokio::spawn(async move {
+                    let upload_res = client
+                        .upload(bytes.clone(), MediaType::Image, UploadOptions::default())
+                        .await;
+                    match upload_res {
+                        Ok(upload) => {
+                            let thumb = image::load_from_memory(&bytes)
+                                .ok()
+                                .and_then(|img| thumbnail_jpeg(&img))
+                                .unwrap_or_default();
+                            match client
+                                .status()
+                                .send_image(
+                                    upload,
+                                    thumb,
+                                    caption.as_deref(),
+                                    &recipients,
+                                    Default::default(),
+                                )
+                                .await
+                            {
+                                Ok(_) => {
+                                    let _ = events.send(Event::StoryPosted(Ok(())));
+                                }
+                                Err(e) => {
+                                    let _ = events.send(Event::StoryPosted(Err(e.to_string())));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = events.send(Event::StoryPosted(Err(e.to_string())));
+                        }
+                    }
+                    waker.wake();
+                });
+            }
+            Command::PostVideoStory { path, caption } => {
+                let Some(client) = self.client.clone() else {
+                    self.emit(Event::StoryPosted(Err("Not connected to WhatsApp".into())));
+                    return;
+                };
+                let mut recipient_set = std::collections::HashSet::new();
+                if let Ok(contacts) = self.archive.contacts() {
+                    for c in contacts {
+                        if let Ok(jid) = c.id.parse::<Jid>() {
+                            if (jid.is_pn() || jid.is_lid()) && !self.is_me(&c.id) {
+                                recipient_set.insert(jid);
+                            }
+                        }
+                    }
+                }
+                if let Ok(chats) = self.archive.chats() {
+                    for c in chats {
+                        if c.kind == ChatKind::Direct {
+                            if let Ok(jid) = c.id.parse::<Jid>() {
+                                if (jid.is_pn() || jid.is_lid()) && !self.is_me(&c.id) {
+                                    recipient_set.insert(jid);
+                                }
+                            }
+                        }
+                    }
+                }
+                let recipients: Vec<Jid> = recipient_set.into_iter().collect();
+                if recipients.is_empty() {
+                    self.emit(Event::StoryPosted(Err(
+                        "No contacts found to share status with".into(),
+                    )));
+                    return;
+                }
+                let events = self.events.clone();
+                let waker = self.waker.clone();
+                tokio::spawn(async move {
+                    let bytes = match tokio::fs::read(&path).await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            let _ = events.send(Event::StoryPosted(Err(format!(
+                                "Could not read video: {e}"
+                            ))));
+                            waker.wake();
+                            return;
+                        }
+                    };
+                    let poster = {
+                        let bytes_clone = bytes.clone();
+                        tokio::task::spawn_blocking(move || crate::animation::poster(&bytes_clone))
+                            .await
+                            .ok()
+                            .flatten()
+                    };
+                    let thumb = poster
+                        .as_ref()
+                        .and_then(|poster| poster.picture.clone())
+                        .and_then(|picture| {
+                            thumbnail_jpeg(&image::DynamicImage::ImageRgb8(picture))
+                        })
+                        .unwrap_or_default();
+                    let seconds = poster.as_ref().map(|poster| poster.seconds).unwrap_or(0);
+
+                    let upload_res = client
+                        .upload(bytes, MediaType::Video, UploadOptions::default())
+                        .await;
+                    match upload_res {
+                        Ok(upload) => {
+                            match client
+                                .status()
+                                .send_video(
+                                    upload,
+                                    thumb,
+                                    seconds,
+                                    caption.as_deref(),
+                                    &recipients,
+                                    Default::default(),
+                                )
+                                .await
+                            {
+                                Ok(_) => {
+                                    let _ = events.send(Event::StoryPosted(Ok(())));
+                                }
+                                Err(e) => {
+                                    let _ = events.send(Event::StoryPosted(Err(e.to_string())));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = events.send(Event::StoryPosted(Err(e.to_string())));
+                        }
+                    }
+                    waker.wake();
+                });
+            }
+            Command::ViewStory { sender, id } => {
+                if let Some(client) = self.client.clone() {
+                    let jid = Jid::status_broadcast();
+                    let sender_jid = sender.parse::<Jid>().ok();
+                    let ids = vec![id];
+                    tokio::spawn(async move {
+                        let ids_ref: Vec<&str> = ids.iter().map(String::as_str).collect();
+                        if let Err(error) = client
+                            .mark_as_read(&jid, sender_jid.as_ref(), &ids_ref)
+                            .await
+                        {
+                            log::debug!("status read receipt not sent: {error}");
+                        }
+                    });
+                }
+            }
+            Command::DownloadStoryMedia { id, raw_message } => {
+                let Some(client) = self.client.clone() else {
+                    return;
+                };
+                let Ok(wa_msg) = wa::Message::decode_from_slice(&raw_message) else {
+                    return;
+                };
+                let base = wa_msg.get_base_message();
+                let mut downloadable: Option<Box<dyn Downloadable>> = None;
+                let mut file_ext = "";
+                if let Some(img) = base.image_message.as_option() {
+                    downloadable = Some(Box::new(img.clone()));
+                    file_ext = "jpg";
+                } else if let Some(vid) = base.video_message.as_option() {
+                    downloadable = Some(Box::new(vid.clone()));
+                    file_ext = "mp4";
+                }
+                if let Some(dl) = downloadable {
+                    let dir = self.download_dir("status@broadcast");
+                    let dest_path = dir.join(format!("story-{}.{}", id, file_ext));
+                    if dest_path.exists() {
+                        self.emit(Event::StoryMediaDownloaded {
+                            id,
+                            path: dest_path.to_string_lossy().to_string(),
+                        });
+                        return;
+                    }
+                    let events = self.events.clone();
+                    let waker = self.waker.clone();
+                    let story_id = id;
+                    let dest_dir = dir;
+                    tokio::spawn(async move {
+                        let result = with_attachment_deadline(ATTACHMENT_TIMEOUT, async {
+                            download_attachment(&client, &*dl, &dest_dir, &dest_path, ATTACHMENT_DOWNLOAD_LIMIT).await
+                        })
+                        .await;
+                        match result {
+                            Ok(p) => {
+                                log::info!("Downloaded story media for {}: {:?}", story_id, p);
+                                let _ = events.send(Event::StoryMediaDownloaded {
+                                    id: story_id,
+                                    path: p.to_string_lossy().to_string(),
+                                });
+                                waker.wake();
+                            }
+                            Err(e) => {
+                                log::warn!("Failed to download story media {}: {}", story_id, e);
+                            }
+                        }
+                    });
+                }
+            }
+            Command::ReplyStory {
+                sender,
+                story_id,
+                text,
+                raw_message,
+            } => {
+                self.reply_story(sender, story_id, text, raw_message);
+            }
+            Command::RevokeStory(id) => {
+                self.revoke_story(id);
+            }
             Command::FetchBlocklist => self.fetch_blocklist(),
             Command::SetBlocked { chat, blocked } => self.set_blocked(chat, blocked),
             Command::BlocklistFetched { generation, result } => {

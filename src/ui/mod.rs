@@ -28,6 +28,8 @@ pub mod picker;
 pub mod polls;
 pub mod rail;
 pub mod settings;
+pub mod stories;
+pub mod stories_page;
 pub mod update;
 mod voice_bar;
 pub mod widgets;
@@ -122,6 +124,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     image_preview::show_sticker(app, ctx);
     call::show(app, ctx);
     image_editor::show(app, ctx);
+    if app.page != Page::Stories {
+        stories::viewer_show(app, ctx);
+    }
+    stories::post_modal_show(app, ctx);
     overlay::finish(ctx);
     drop_target(app, ctx);
     toasts(app, ctx);
@@ -136,6 +142,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
 fn list_pane_only(app: &App) -> bool {
     match app.page {
         Page::Chats => app.current_chat().is_none(),
+        Page::Stories => false,
         Page::Calls => app.current_chat().is_none() || !app.call_picked(),
         Page::Settings | Page::Wallpaper => false,
     }
@@ -160,7 +167,9 @@ fn main_view(app: &mut App, ui: &mut egui::Ui, list_only: bool) {
     // too little room for it and the conversation, the list and the rail
     // step aside while the panel is open. The Calls tab's history needs the
     // full list pane: only the chats collapse into the rail's avatars.
-    let full_list = app.sidebar_mode() == SidebarDisplayMode::Expanded || app.page == Page::Calls;
+    let full_list = app.sidebar_mode() == SidebarDisplayMode::Expanded
+        || app.page == Page::Calls
+        || app.page == Page::Stories;
     let mut list_width = chats::compact_width(ui.ctx());
     if full_list {
         list_width += app.settings.sidebar_width;
@@ -173,7 +182,11 @@ fn main_view(app: &mut App, ui: &mut egui::Ui, list_only: bool) {
     if !narrow(ui.ctx()) && !crowded {
         rail::show(app, ui, !full_list);
         if full_list {
-            chats::show(app, ui);
+            if app.page == Page::Stories {
+                stories_page::sidebar(app, ui);
+            } else {
+                chats::show(app, ui);
+            }
         }
     }
     let search_overlay = pane::show(app, ui);
@@ -190,6 +203,7 @@ fn main_view(app: &mut App, ui: &mut egui::Ui, list_only: bool) {
             );
             match app.page {
                 Page::Settings => settings::show(app, ui),
+                Page::Stories => stories_page::show(app, ui),
                 Page::Chats => conversation::show(app, ui),
                 // The open chat stays beside the call history.
                 Page::Calls if app.current_chat().is_some() => conversation::show(app, ui),

@@ -681,6 +681,7 @@ pub struct Player {
     side: u32,
     /// Playback speed, kept from one video to the next.
     speed: f32,
+    unsupported: std::collections::HashSet<String>,
 }
 
 impl Player {
@@ -701,6 +702,7 @@ impl Player {
             seen: Cell::new(Instant::now()),
             side: MAX_SIDE,
             speed: 1.0,
+            unsupported: std::collections::HashSet::new(),
         }
     }
 
@@ -860,6 +862,23 @@ impl Player {
         }
     }
 
+    /// Whether this message's video failed decoding and is unsupported.
+    pub fn is_unsupported(&self, message: &str) -> bool {
+        self.unsupported.contains(message)
+    }
+
+    /// Explicitly mark a message as unsupported.
+    pub fn mark_unsupported(&mut self, message: &str) {
+        self.unsupported.insert(message.to_owned());
+    }
+
+    /// Pauses playback of the active video.
+    pub fn pause(&mut self) {
+        if let Some(session) = self.session.as_mut() {
+            session.pause(Instant::now());
+        }
+    }
+
     /// Stops playback and releases the decoder, the texture, and the device.
     pub fn stop(&mut self) {
         self.session = None;
@@ -989,6 +1008,7 @@ impl Player {
                 Ok(Delivery::Unsupported(reason)) => {
                     log::info!("video opens in the system player: {reason}");
                     let path = session.path.clone();
+                    self.unsupported.insert(session.message.clone());
                     self.session = None;
                     return Some(Notice::Unsupported(path));
                 }
@@ -1005,6 +1025,7 @@ impl Player {
             } else if session.decoded {
                 // Not one frame decoded: hand the file to the system player.
                 let path = session.path.clone();
+                self.unsupported.insert(session.message.clone());
                 self.session = None;
                 return Some(Notice::Unsupported(path));
             } else {

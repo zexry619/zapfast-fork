@@ -2021,9 +2021,10 @@ impl Contact {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
     Chats,
+    Stories,
     /// Every call of the account, newest first.
     Calls,
     Settings,
@@ -2708,6 +2709,43 @@ pub fn forward_limit(frequently_forwarded: bool) -> usize {
 /// Actions queued by views and applied after drawing.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
+    /// Opens the story viewer for a contact at a given item index.
+    OpenStoryViewer {
+        sender: String,
+        index: usize,
+    },
+    /// Closes the story viewer.
+    CloseStoryViewer,
+    /// Advances to next story in the viewer.
+    NextStory,
+    /// Goes back to previous story in the viewer.
+    PrevStory,
+    /// Opens the post story dialog.
+    OpenPostStory,
+    /// Closes the post story dialog.
+    ClosePostStory,
+    /// Posts a text story to WhatsApp status.
+    PostTextStory {
+        text: String,
+        background_argb: u32,
+        font: u32,
+    },
+    /// Posts a media story (photo or video) to WhatsApp status.
+    PostMediaStory {
+        path: std::path::PathBuf,
+        caption: Option<String>,
+    },
+    /// Replies to a WhatsApp status / story.
+    ReplyStory {
+        sender: String,
+        story_id: String,
+        text: String,
+        raw_message: Option<Vec<u8>>,
+    },
+    /// Selects a contact's story in the stories page.
+    SelectStoryContact(String),
+    /// Revokes (deletes) our own posted status update.
+    RevokeStory(String),
     FetchBlocklist,
     SetBlocked {
         chat: ChatId,

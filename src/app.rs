@@ -848,6 +848,16 @@ pub struct App {
     /// What the Settings page is filtered by.
     pub settings_search: String,
     pub focus_settings_search: bool,
+    /// WhatsApp status/stories cache and state.
+    pub stories: crate::stories::StoriesStore,
+    pub story_viewer: Option<crate::ui::stories::StoryViewerState>,
+    pub post_story_open: bool,
+    pub post_story_text: String,
+    pub post_story_color_idx: usize,
+    pub post_story_font_idx: usize,
+    pub post_story_media_path: Option<PathBuf>,
+    /// Active contact selected in the Stories page sidebar.
+    pub active_story_contact: Option<String>,
     pub quit_requested: bool,
     pub window_focused: bool,
     /// A notification went out this frame: highlight the taskbar entry of a
@@ -1556,6 +1566,13 @@ impl App {
         // With a password set, ZapFast starts locked.
         let app_lock = crate::app_lock::AppLock::new(settings.app_lock_hash.is_some());
         let tray_lockable = settings.app_lock_hash.is_some();
+        let stories_file = dirs.state.join("stories.json");
+        let mut stories = crate::stories::StoriesStore::load(&stories_file);
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        stories.clean_expired(now_secs);
         let mut app = Self {
             dirs,
             settings,
@@ -1746,6 +1763,14 @@ impl App {
             focus_search: false,
             settings_search: String::new(),
             focus_settings_search: false,
+            stories,
+            story_viewer: None,
+            post_story_open: false,
+            post_story_text: String::new(),
+            post_story_color_idx: 0,
+            post_story_font_idx: 0,
+            post_story_media_path: None,
+            active_story_contact: None,
             quit_requested: false,
             window_focused: false,
             wants_attention: false,
@@ -3691,6 +3716,30 @@ impl App {
 
     fn apply_backend_event(&mut self, event: Event, live: bool) {
         match event {
+            Event::StoryReceived(item) => {
+                self.stories.add(*item);
+                let stories_file = self.dirs.state.join("stories.json");
+                self.stories.save(&stories_file);
+            }
+            Event::StoryPosted(result) => match result {
+                Ok(()) => {
+                    self.toast(crate::i18n::gettext(self.locale, "Status update posted"));
+                }
+                Err(err) => {
+                    self.toast_error(format!("Failed to post status: {err}"));
+                }
+            },
+            Event::StoryMediaDownloaded { id, path } => {
+                self.stories.set_media_path(&id, path);
+                let stories_file = self.dirs.state.join("stories.json");
+                self.stories.save(&stories_file);
+                self.waker.wake();
+            }
+            Event::StoryRevoked(id) => {
+                self.stories.remove_story(&id);
+                let stories_file = self.dirs.state.join("stories.json");
+                self.stories.save(&stories_file);
+            }
             Event::StorageStats {
                 stats,
                 token,
@@ -10091,6 +10140,162 @@ impl App {
                     account.settings.notifications = on;
                     account.mark_settings_dirty();
                 }
+            }
+            Action::OpenStoryViewer { sender, index } => {
+                self.story_viewer = Some(crate::ui::stories::StoryViewerState::new(sender, index));
+            }
+            Action::CloseStoryViewer => {
+                self.story_viewer = None;
+            }
+            Action::NextStory => {
+                if let Some(viewer) = self.story_viewer.clone() {
+                    if let Some((next_sender, next_index)) =
+                        self.stories.next_item(&viewer.sender, viewer.index)
+                    {
+                        self.story_viewer = Some(crate::ui::stories::StoryViewerState::new(
+                            next_sender,
+                            next_index,
+                        ));
+                    } else {
+                        self.story_viewer = None;
+                    }
+                }
+            }
+            Action::PrevStory => {
+                if let Some(viewer) = self.story_viewer.clone() {
+                    if let Some((prev_sender, prev_index)) =
+                        self.stories.prev_item(&viewer.sender, viewer.index)
+                    {
+                        self.story_viewer = Some(crate::ui::stories::StoryViewerState::new(
+                            prev_sender,
+                            prev_index,
+                        ));
+                    } else {
+                        self.story_viewer = None;
+                    }
+                }
+            }
+            Action::OpenPostStory => {
+                self.post_story_open = true;
+            }
+            Action::ClosePostStory => {
+                self.post_story_open = false;
+                self.post_story_text.clear();
+                self.post_story_media_path = None;
+            }
+            Action::PostTextStory {
+                text,
+                background_argb,
+                font,
+            } => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let id = format!("local-status-{}", now);
+                let my_sender = self.me.clone().unwrap_or_else(|| "me".to_string());
+                self.stories.add(crate::stories::StoryItem {
+                    id: id.clone(),
+                    sender: my_sender,
+                    sender_name: Some("You".to_string()),
+                    timestamp: now,
+                    text: Some(text.clone()),
+                    background_argb: Some(background_argb),
+                    font: Some(font),
+                    media_type: None,
+                    caption: None,
+                    thumbnail: None,
+                    media_path: None,
+                    raw_message: None,
+                    viewed: true,
+                });
+                let stories_file = self.dirs.state.join("stories.json");
+                self.stories.save(&stories_file);
+
+                self.backend.send(Command::PostTextStory {
+                    text,
+                    background_argb,
+                    font,
+                });
+            }
+            Action::PostMediaStory { path, caption } => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let id = format!("local-status-{}", now);
+                let my_sender = self.me.clone().unwrap_or_else(|| "me".to_string());
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                let is_video = ["mp4", "mov", "mkv", "webm", "3gp"].contains(&ext.as_str());
+
+                self.stories.add(crate::stories::StoryItem {
+                    id: id.clone(),
+                    sender: my_sender,
+                    sender_name: Some("You".to_string()),
+                    timestamp: now,
+                    text: None,
+                    background_argb: None,
+                    font: None,
+                    media_type: Some(if is_video {
+                        crate::stories::StoryMediaType::Video
+                    } else {
+                        crate::stories::StoryMediaType::Image
+                    }),
+                    caption: caption.clone(),
+                    thumbnail: None,
+                    media_path: Some(path.to_string_lossy().to_string()),
+                    raw_message: None,
+                    viewed: true,
+                });
+                let stories_file = self.dirs.state.join("stories.json");
+                self.stories.save(&stories_file);
+
+                if is_video {
+                    self.backend.send(Command::PostVideoStory { path, caption });
+                } else if let Ok(bytes) = std::fs::read(&path) {
+                    self.backend
+                        .send(Command::PostImageStory { bytes, caption });
+                }
+            }
+            Action::ReplyStory {
+                sender,
+                story_id,
+                text,
+                raw_message,
+            } => {
+                self.backend.send(Command::ReplyStory {
+                    sender,
+                    story_id,
+                    text,
+                    raw_message,
+                });
+            }
+            Action::SelectStoryContact(jid) => {
+                self.active_story_contact = Some(jid.clone());
+                if let Some(items) = self.stories.stories_by_sender.get(&jid) {
+                    if !items.is_empty() {
+                        let idx = items.iter().position(|it| !it.viewed).unwrap_or(0);
+                        self.apply(
+                            Action::OpenStoryViewer {
+                                sender: jid,
+                                index: idx,
+                            },
+                            ctx,
+                        );
+                    }
+                }
+            }
+            Action::RevokeStory(id) => {
+                self.backend.send(Command::RevokeStory(id.clone()));
+                self.stories.remove_story(&id);
+                let stories_file = self.dirs.state.join("stories.json");
+                self.stories.save(&stories_file);
+                self.story_viewer = None;
+                self.toast("Status deleted");
             }
         }
     }

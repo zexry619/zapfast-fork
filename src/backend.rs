@@ -142,6 +142,41 @@ pub struct SendTurn {
 
 #[derive(Debug)]
 pub enum Command {
+    /// Post a text status / story to contacts.
+    PostTextStory {
+        text: String,
+        background_argb: u32,
+        font: u32,
+    },
+    /// Post an image status / story.
+    PostImageStory {
+        bytes: Vec<u8>,
+        caption: Option<String>,
+    },
+    /// Post a video status / story.
+    PostVideoStory {
+        path: std::path::PathBuf,
+        caption: Option<String>,
+    },
+    /// Mark a story as viewed.
+    ViewStory {
+        sender: String,
+        id: String,
+    },
+    /// Download story media from its raw protobuf message.
+    DownloadStoryMedia {
+        id: String,
+        raw_message: Vec<u8>,
+    },
+    /// Reply to a status / story with a quoted message.
+    ReplyStory {
+        sender: String,
+        story_id: String,
+        text: String,
+        raw_message: Option<Vec<u8>>,
+    },
+    /// Revokes an owned story/status by id.
+    RevokeStory(String),
     FetchBlocklist,
     SetBlocked {
         chat: ChatId,
@@ -1178,6 +1213,17 @@ pub enum Command {
 
 #[derive(Debug)]
 pub enum Event {
+    /// A new WhatsApp status / story arrived.
+    StoryReceived(Box<crate::stories::StoryItem>),
+    /// Result of attempting to post a status.
+    StoryPosted(Result<(), String>),
+    /// Full story media downloaded to disk.
+    StoryMediaDownloaded {
+        id: String,
+        path: String,
+    },
+    /// An owned story was revoked.
+    StoryRevoked(String),
     Blocklist {
         state: crate::blocking::Blocklist,
         error: Option<crate::blocking::Failure>,

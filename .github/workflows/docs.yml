@@ -30,4 +30,5 @@ jobs:
   # (docs/_includes/jekyll_vitepress/head_end.html), so a local
   # `jekyll serve` does not report visits.
   docs:
+    if: github.repository == 'crmne/zapfast' || github.event_name == 'workflow_dispatch'
     uses: crmne/jekyll-vitepress-theme/.github/workflows/publish-docs.yml@v1
